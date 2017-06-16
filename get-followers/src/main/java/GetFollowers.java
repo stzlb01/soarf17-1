@@ -1,7 +1,7 @@
 /*
  * SOAR Project Fall 2017
  * Advisor: Thyago Mota
- * Student:
+ * Student: Zachary Balga
  * Description: obtain followers of a given account
  */
 
@@ -13,6 +13,7 @@ import com.mongodb.client.*;
 import org.bson.*;
 
 public class GetFollowers {
+    // implements RateLimitStatusListener
 
     private Twitter twitter;
 
@@ -20,37 +21,44 @@ public class GetFollowers {
     private MongoDatabase soarf17;
 
     private String screenName;
-    private long    followers_cursor;
+    private long   nextFollowersCursor;
 
     private static Logger log = Logger.getLogger(GetFollowers.class);
 
     GetFollowers(String args[]) {
-
         // command-line validation
         if (args.length == 0) {
             help();
             throw new IllegalArgumentException();
         }
-        this.screenName = args[0];
-        this.followers_cursor = -1;
+        this.screenName = args[0].toLowerCase();
+        this.nextFollowersCursor = -1;
+    }
 
-        // MongoDB connection
+    private void connectMongoDB() {
+        log.info("in connectMongoDB()");
+
         this.mongoClient = new MongoClient(Configuration.DB_SERVER, Configuration.DB_PORT);
         this.soarf17 = this.mongoClient.getDatabase(Configuration.DB_NAME);
+    }
 
-        // TwitterAPI authentication
+    private void connectTwitter() {
+        log.info("in connectTwitter()");
+
         this.twitter = TwitterFactory.getSingleton();
         this.twitter.setOAuthConsumer(Configuration.CONSUMER_KEY, Configuration.CONSUMER_SECRET);
         AccessToken accessToken = new AccessToken(Configuration.ACCESS_TOKEN_KEY, Configuration.ACCESS_TOKEN_SECRET);
         this.twitter.setOAuthAccessToken(accessToken);
+        // this.twitter.addRateLimitStatusListener(this);
     }
 
     void help() {
         System.out.println("Use: java " + GetFollowers.class + " <screen_name>\n");
     }
 
-    void updateProfile() throws TwitterException {
+    private void updateProfile() throws TwitterException {
         log.info("in updateProfile()");
+
         MongoCollection usersCollection = this.soarf17.getCollection("users");
         String strQuery = "{\"screen_name\": \"" + this.screenName + "\"}";
         BasicDBObject queryObj = (BasicDBObject) JSON.parse(strQuery);
@@ -61,7 +69,7 @@ public class GetFollowers {
         if (cursor.hasNext()) {
             log.info("-> " + this.screenName + " was found!");
             Document doc = (Document) cursor.next();
-            this.followers_cursor = (Long) doc.get("followers_cursor");
+            this.nextFollowersCursor = doc.getLong("next_followers_cursor");
             firstTimeUser = false;
         }
         log.info("-> querying Twitter for user " + this.screenName);
@@ -70,65 +78,80 @@ public class GetFollowers {
             log.info("-> firstTimeUser: inserting new user into DB");
             String strInsert = "{" +
                     "\"_id\": " + user.getId() + ", " +
-                    "\"screen_name\": \"" + user.getScreenName()  + "\", " +
+                    "\"screen_name\": \"" + this.screenName  + "\", " +
                     "\"description\": \"" + user.getDescription() + "\", " +
+                    "\"location\": \"" + user.getLocation() + "\", " +
+                    "\"protected\": " + user.isProtected() + ", " +
                     "\"followers\": [], " +
-                    "\"followers_cursor\": " + this.followers_cursor + "}";
-            log.info(strInsert);
+                    "\"next_followers_cursor\": " + this.nextFollowersCursor + "}";
+            //log.info(strInsert);
             Document doc = Document.parse(strInsert);
             usersCollection.insertOne(doc);
         }
         else {
-            log.info("-> NOT firstTimeUser: updating key attributes...");
-            /*String strUpdate = "{" +
+            log.info("-> NOT firstTimeUser: updating key attributes in DB");
+            String strUpdate = "{" +
                     "$set: {" +
-                    "\"followers_cursor\": " + this.followers_cursor + "}}";
-            log.info(strUpdate);
+                    "\"description\": \"" + user.getDescription() + "\", " +
+                    "\"location\": \"" + user.getLocation() + "\", " +
+                    "\"protected\": " + user.isProtected() + "}}";
+            //log.info(strUpdate);
             BasicDBObject updateObj = (BasicDBObject) JSON.parse(strUpdate);
-            usersCollection.updateOne(queryObj, updateObj);*/
+            usersCollection.updateOne(queryObj, updateObj);
         }
-        log.info("done updateProfile()");
+        log.info("updateProfile() is done");
     }
 
     void run() throws TwitterException {
         log.info("in run()");
+        connectMongoDB();
+        connectTwitter();
         updateProfile();
 
+        // prepare basic user query
         MongoCollection usersCollection = this.soarf17.getCollection("users");
         String strQuery = "{\"screen_name\": \"" + this.screenName + "\"}";
         BasicDBObject queryObj = (BasicDBObject) JSON.parse(strQuery);
 
+        // variables declaration
         PagableResponseList<User> users;
-        while (true) {
-            log.info("-> getFollowersList called");
-            users = twitter.getFollowersList(this.screenName, this.followers_cursor);
-            log.info("-> updating followers");
-            for (User user : users) {
+
+        // loop until you get ALL of the followers
+        while (this.nextFollowersCursor != 0) {
+            try {
+                // get the next page of followers
+                log.info("-> getFollowersList called");
+                users = twitter.getFollowersList(this.screenName, this.nextFollowersCursor);
+                log.info("-> updating followers in DB");
+                for (User user : users) {
+                    String strUpdate = "{" +
+                            "$addToSet: {" +
+                            "\"followers\": \"" + user.getScreenName().toLowerCase() + "\"}}";
+                    BasicDBObject updateObj = (BasicDBObject) JSON.parse(strUpdate);
+                    usersCollection.updateOne(queryObj, updateObj);
+                }
+                this.nextFollowersCursor = users.getNextCursor();
+
+                // update MongoDB with the new nextFollowersCursor
+                log.info("-> updating next_followers_cursor in DB");
                 String strUpdate = "{" +
-                        "$addToSet: {" +
-                        "\"followers\": \"" + user.getScreenName() + "\"}}";
+                        "$set: {" +
+                        "\"next_followers_cursor\": " + this.nextFollowersCursor + "}}";
                 BasicDBObject updateObj = (BasicDBObject) JSON.parse(strUpdate);
                 usersCollection.updateOne(queryObj, updateObj);
             }
-            this.followers_cursor = users.getNextCursor();
-            log.info("-> new followers_cursor is " + this.followers_cursor);
-            if (this.followers_cursor == 0) {
-                log.info("-> now more followers so leaving run()");
-                break;
-            }
-            // update MongoDB
-            log.info("-> updating followers_cursor");
-            String strUpdate = "{" +
-                    "$set: {" +
-                    "\"followers_cursor\": " + this.followers_cursor + "}}";
-            BasicDBObject updateObj = (BasicDBObject) JSON.parse(strUpdate);
-            usersCollection.updateOne(queryObj, updateObj);
-            try {
-                log.info("-> sleeping for 5s now...");
-                Thread.sleep(5000);
-            }
-            catch (InterruptedException ex) {
+            catch (TwitterException twitterEx) {
+                if (twitterEx.exceededRateLimitation()) {
+                    RateLimitStatus rateLimitStatus = twitterEx.getRateLimitStatus();
+                    int secondsUntilReset = rateLimitStatus.getSecondsUntilReset();
+                    log.info("-> Rate limit exceeded: " + secondsUntilReset + "s until reset...");
+                    try {
+                        Thread.sleep((secondsUntilReset + 5) * 1000);
+                    }
+                    catch (InterruptedException interruptedEx) {
 
+                    }
+                }
             }
         }
     }
