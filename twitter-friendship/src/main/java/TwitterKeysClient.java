@@ -9,8 +9,8 @@ public class TwitterKeysClient {
     public static void main(String[] args) throws Exception {
         Registry registry = LocateRegistry.getRegistry();
         TwitterKeysManagerRemote twitterKeysManagerRemote = (TwitterKeysManagerRemote) registry.lookup("twitterkeys");
-        //TwitterKey twitterKey = twitterKeysManagerRemote.getAvailableKey();
+        //TwitterKey twitterKey = twitterKeysManagerRemote.requestKey(TwitterKeysClient.class.toString());
         //System.out.println(twitterKey);
-        twitterKeysManagerRemote.releaseKey(3);
+        twitterKeysManagerRemote.releaseKey(1);
     }
 }
